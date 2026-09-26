@@ -1,0 +1,4 @@
+# Preserve patch and recipe bytes on Windows checkouts.
+patches/acp-wake-env/** text eol=lf
+# Unified diffs require context-prefix spaces and a format-patch signature.
+patches/acp-wake-env/*.patch -whitespace
