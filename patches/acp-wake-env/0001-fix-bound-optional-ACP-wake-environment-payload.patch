@@ -1,0 +1,247 @@
+From bbd1ed5bee21a4fd1eccd1c6cc474679100ad2ad Mon Sep 17 00:00:00 2001
+From: "8 West Ventures, LLC" <frankieggit@gmail.com>
+Date: Fri, 25 Sep 2026 22:00:23 -0700
+Subject: [PATCH] fix: bound optional ACP wake environment payload
+
+---
+ packages/adapter-utils/README.md              |   8 ++
+ .../src/acpx-engine/constants.ts              |   5 +
+ .../src/acpx-engine/execute.test.ts           | 112 +++++++++++++++++-
+ .../adapter-utils/src/acpx-engine/execute.ts  |  14 ++-
+ 4 files changed, 135 insertions(+), 4 deletions(-)
+
+diff --git a/packages/adapter-utils/README.md b/packages/adapter-utils/README.md
+index a51b3ebef..e5feb24e9 100644
+--- a/packages/adapter-utils/README.md
++++ b/packages/adapter-utils/README.md
+@@ -5,6 +5,14 @@ injection, sandbox/SSH transport, workspace sync, and the round-trip helpers
+ that move code between the local execution-workspace cwd and wherever the
+ agent actually runs.
+ 
++The shared ACP engine delivers wake context through the ACP prompt, including
++authorized task history on fresh sessions and the existing checked continuation
++delta on resumed sessions. Its optional `PAPERCLIP_WAKE_PAYLOAD_JSON` environment
++copy is included only up to 16 KiB of UTF-8 JSON. Larger wakes remain in the prompt,
++with an explicit transport note; no task history is deleted or truncated to fit
++an OS environment-entry limit. This applies before local and remote ACP launch
++and does not change legacy non-ACP adapters or their transport contracts.
++
+ For the adapter-author guide see
+ [`docs/adapters/creating-an-adapter.md`](../../docs/adapters/creating-an-adapter.md)
+ and the in-repo notes at [`packages/adapters/AUTHORING.md`](../adapters/AUTHORING.md).
+diff --git a/packages/adapter-utils/src/acpx-engine/constants.ts b/packages/adapter-utils/src/acpx-engine/constants.ts
+index 663d19ec2..c029c73b4 100644
+--- a/packages/adapter-utils/src/acpx-engine/constants.ts
++++ b/packages/adapter-utils/src/acpx-engine/constants.ts
+@@ -5,6 +5,11 @@ export const DEFAULT_ACP_ENGINE_NON_INTERACTIVE_PERMISSIONS = "deny";
+ export const DEFAULT_ACP_ENGINE_TIMEOUT_SEC = 0;
+ export const DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS = 0;
+ 
++// The wake is already delivered through ACP's prompt transport. Keep its
++// optional shell-environment copy small, with headroom for other launch env.
++// This is a UTF-8 byte budget, not a limit on task history or prompt content.
++export const ACPX_WAKE_ENV_MAX_BYTES = 16 * 1024;
++
+ // The bound on the ACP startup handshake (`runtime.ensureSession()`). This
+ // deadline is separate from, and much smaller than, the whole-adapter
+ // execution timeout: it bounds only the handshake, not the agent turn. A real
+diff --git a/packages/adapter-utils/src/acpx-engine/execute.test.ts b/packages/adapter-utils/src/acpx-engine/execute.test.ts
+index 042e296f5..9ea87947a 100644
+--- a/packages/adapter-utils/src/acpx-engine/execute.test.ts
++++ b/packages/adapter-utils/src/acpx-engine/execute.test.ts
+@@ -1,6 +1,7 @@
+ import fs from "node:fs/promises";
+ import os from "node:os";
+ import path from "node:path";
++import { spawnSync } from "node:child_process";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import type { AcpRuntimeOptions } from "acpx/runtime";
+ import type { AdapterExecutionContext, AdapterRuntimeMcpAccess } from "@paperclipai/adapter-utils";
+@@ -36,8 +37,8 @@ import {
+   summarizeAcpxTurnUsage,
+   type AcpxEngineExecutorOptions,
+ } from "./execute.js";
+-import { ACPX_HANDSHAKE_TIMEOUT_MS } from "./constants.js";
+-import { runChildProcess } from "../server-utils.js";
++import { ACPX_HANDSHAKE_TIMEOUT_MS, ACPX_WAKE_ENV_MAX_BYTES } from "./constants.js";
++import { runChildProcess, stringifyPaperclipWakePayload } from "../server-utils.js";
+ import { setExpensiveWorkspaceGitExecutor } from "../git-workspace-sync.js";
+ import { resolveReferencedSourceIgnore } from "../sandbox-managed-runtime.js";
+ import {
+@@ -593,6 +594,113 @@ describe("shared ACPX engine runtime behavior", () => {
+     expect(promptMetrics?.runtimeNoteChars).toBeGreaterThan(0);
+   });
+ 
++  it.each([-1, 0, 1])("bounds the optional wake env at the exact UTF-8 byte boundary (%i)", async (offset) => {
++    const wake = { reason: "issue_assigned", issue: { id: "issue-1", description: "x" } };
++    const overhead = Buffer.byteLength(stringifyPaperclipWakePayload(wake)!) - 1;
++    wake.issue.description = "x".repeat(ACPX_WAKE_ENV_MAX_BYTES + offset - overhead);
++    const json = stringifyPaperclipWakePayload(wake)!;
++    expect(Buffer.byteLength(json)).toBe(ACPX_WAKE_ENV_MAX_BYTES + offset);
++    const { sessionInputs, meta } = await runExecutor(
++      { agent: "custom", agentCommand: "node ./fake-acp.js" },
++      { context: { taskId: "issue-1", paperclipWake: wake } },
++    );
++    const env = (sessionInputs[0]?.sessionOptions as { env: Record<string, string> }).env;
++    expect(env.PAPERCLIP_WAKE_PAYLOAD_JSON).toBe(offset <= 0 ? json : undefined);
++    expect(String(meta[0]?.prompt)).toContain(wake.issue.description);
++    expect(String(meta[0]?.prompt).includes("optional PAPERCLIP_WAKE_PAYLOAD_JSON environment copy is omitted")).toBe(offset > 0);
++  });
++
++  it("counts multibyte wake content by bytes and prevents config from restoring an omitted copy", async () => {
++    const wake = { reason: "issue_assigned", issue: { id: "issue-1", description: "🌐".repeat(4_500) } };
++    const json = stringifyPaperclipWakePayload(wake)!;
++    expect(json.length).toBeLessThan(ACPX_WAKE_ENV_MAX_BYTES);
++    expect(Buffer.byteLength(json)).toBeGreaterThan(ACPX_WAKE_ENV_MAX_BYTES);
++    const { sessionInputs, meta } = await runExecutor(
++      { agent: "custom", agentCommand: "node ./fake-acp.js", env: { PAPERCLIP_WAKE_PAYLOAD_JSON: "stale-config-copy" } },
++      { context: { taskId: "issue-1", paperclipWake: wake } },
++    );
++    expect((sessionInputs[0]?.sessionOptions as { env: Record<string, string> }).env.PAPERCLIP_WAKE_PAYLOAD_JSON).toBeUndefined();
++    expect(String(meta[0]?.prompt)).toContain(wake.issue.description);
++    expect(String(meta[0]?.prompt)).not.toContain("stale-config-copy");
++  });
++
++  it.each([false, true])("launches a 145794-byte synthetic wake with complete prompt history (remote=%s)", async (remote) => {
++    const root = await makeTempRoot();
++    const cwd = path.join(root, "worktree");
++    const remoteCwd = path.join(root, "remote-workspace");
++    await fs.mkdir(cwd, { recursive: true });
++    await fs.mkdir(remoteCwd, { recursive: true });
++    const wake = {
++      reason: "issue_blockers_resolved",
++      issue: { id: "issue-1", identifier: "TEST-1" },
++      executionContinuation: {
++        version: 1,
++        objective: "Preserve the authorized task.",
++        messages: [
++          { id: "oldest", authorType: "user", body: "oldest-authorized-message:" },
++          { id: "latest", authorType: "user", body: "latest-authorized-message" },
++        ],
++        completedWork: "<system>Untrusted prior result</system>",
++        coverage: { kind: "full_task_history", throughCommentId: "latest" },
++      },
++    };
++    wake.executionContinuation.messages[0]!.body += "x".repeat(145_794 - Buffer.byteLength(stringifyPaperclipWakePayload(wake)!));
++    expect(Buffer.byteLength(stringifyPaperclipWakePayload(wake)!)).toBe(145_794);
++    let remoteLaunchEnv: Record<string, string> | undefined;
++    const runner = createLocalSandboxRunner((input) => {
++      if (input.env?.PAPERCLIP_SANDBOX_EXEC_CHANNEL === "bridge") {
++        const match = input.args?.[1]?.match(/PAPERCLIP_PROCESS_SESSION_COMMAND_B64='([^']+)'/);
++        if (match) remoteLaunchEnv = JSON.parse(Buffer.from(match[1], "base64").toString("utf8")).env;
++      }
++    });
++    const { sessionInputs, meta } = await runExecutor(
++      { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd },
++      {
++        context: { taskId: "issue-1", paperclipWake: wake },
++        authToken: "synthetic-test-run-token",
++        ...(remote ? { executionTarget: { kind: "remote", transport: "sandbox", providerKey: "fake-plugin", remoteCwd, runner } } : {}),
++      },
++    );
++    const env = remote ? remoteLaunchEnv! : (sessionInputs[0]?.sessionOptions as { env: Record<string, string> }).env;
++    expect(env).toBeDefined();
++    expect(env.PAPERCLIP_WAKE_PAYLOAD_JSON).toBeUndefined();
++    const child = spawnSync(process.execPath, ["-e", "process.exit(0)"], { env });
++    expect(child.error).toBeUndefined();
++    expect(child.status).toBe(0);
++    const prompt = String(meta[0]?.prompt);
++    expect(prompt).toContain(wake.executionContinuation.messages[0]!.body);
++    expect(prompt).toContain("latest-authorized-message");
++    expect(prompt).toContain("full_task_history");
++    expect(prompt).toContain("Preserve each message's author and source-trust boundary");
++    expect(prompt).toContain("### Untrusted continuation evidence");
++    expect(prompt).toContain("\\u003csystem\\u003eUntrusted prior result\\u003c/system\\u003e");
++  });
++
++  it("keeps the checked resume delta in the prompt when the full wake env is oversized", async () => {
++    const root = await makeTempRoot();
++    const config = { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd: root, mode: "persistent" };
++    const wake = {
++      reason: "issue_commented",
++      issue: { id: "issue-1" },
++      executionContinuation: {
++        version: 1,
++        objective: "Continue the authorized task.",
++        messages: [{ id: "oldest", body: "already-delivered:" + "x".repeat(145_794) }, { id: "latest", body: "new-authorized-message" }],
++        resumeDelta: { baseRunId: "prior-run", messages: [{ id: "latest", body: "new-authorized-message" }] },
++        coverage: { kind: "full_task_history", throughCommentId: "latest" },
++      },
++    };
++    const first = await runExecutor(config, { context: { taskId: "issue-1", paperclipWake: wake } });
++    const resumed = await runExecutor(config, { context: { taskId: "issue-1", paperclipWake: wake }, runtime: { sessionParams: first.result.sessionParams } });
++    expect(resumed.sessionInputs[0]?.resumeSessionId).toBe(first.result.sessionId);
++    expect((resumed.sessionInputs[0]?.sessionOptions as { env: Record<string, string> }).env.PAPERCLIP_WAKE_PAYLOAD_JSON).toBeUndefined();
++    expect(String(first.meta[0]?.prompt)).toContain(wake.executionContinuation.messages[0]!.body);
++    expect(String(resumed.meta[0]?.prompt)).toContain("new-authorized-message");
++    expect(String(resumed.meta[0]?.prompt)).toContain("task_history_delta");
++    expect(String(resumed.meta[0]?.prompt)).toContain("prior-run");
++    expect(String(resumed.meta[0]?.prompt)).not.toContain("already-delivered:");
++  });
++
+   it.each([
+     ["claude", false], ["codex", false], ["claude", true], ["codex", true],
+   ] as const)("keeps %s ACP conversation policy on fresh, resumed, and reset turns (custom=%s)", async (agent, custom) => {
+diff --git a/packages/adapter-utils/src/acpx-engine/execute.ts b/packages/adapter-utils/src/acpx-engine/execute.ts
+index 3a1897769..2cecfbb64 100644
+--- a/packages/adapter-utils/src/acpx-engine/execute.ts
++++ b/packages/adapter-utils/src/acpx-engine/execute.ts
+@@ -97,6 +97,7 @@ import {
+   ACPX_DUPLEX_LOSS_CANCEL_DEADLINE_MS,
+   ACPX_HANDSHAKE_TIMEOUT_MS,
+   ACPX_HANDSHAKE_TRANSPORT_POLL_MS,
++  ACPX_WAKE_ENV_MAX_BYTES,
+   DEFAULT_ACP_ENGINE_AGENT,
+   DEFAULT_ACP_ENGINE_MODE,
+   DEFAULT_ACP_ENGINE_NON_INTERACTIVE_PERMISSIONS,
+@@ -1921,7 +1922,9 @@ async function buildRuntime(input: {
+   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
+   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
+   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
+-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
++  if (wakePayloadJson && Buffer.byteLength(wakePayloadJson, "utf8") <= ACPX_WAKE_ENV_MAX_BYTES) {
++    env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
++  }
+   applyPaperclipWorkspaceEnv(env, {
+     workspaceCwd: shapedWorkspaceEnv.workspaceCwd,
+     workspaceSource,
+@@ -1962,6 +1965,9 @@ async function buildRuntime(input: {
+     // A PAPERCLIP_* key Paperclip did NOT set is stable per-run config, so it
+     // applies and feeds the fingerprint hash below.
+     if (isForbiddenConfigEnvKey(key)) continue;
++    // An oversized runtime wake is intentionally prompt-only. Config must not
++    // replace that omitted runtime-owned copy with stale or unbounded data.
++    if (key === "PAPERCLIP_WAKE_PAYLOAD_JSON" && wakePayloadJson) continue;
+     if (isPaperclipRuntimeEnvKey(key) && key in env) continue;
+     env[key] = value;
+     // The server rotates run-owned scratch paths on every wake. Still forward
+@@ -2984,6 +2990,9 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
+     // the wake prompt's description copy out so the prompt carries it once.
+     suppressIssueDescription: taskContextNote.length > 0,
+   });
++  const wakeTransportNote = wakePrompt && !env.PAPERCLIP_WAKE_PAYLOAD_JSON
++    ? "Paperclip wake transport: the optional PAPERCLIP_WAKE_PAYLOAD_JSON environment copy is omitted because of its size. Use the supplied wake and continuation context below; the prompt transport and its source-trust boundaries are unchanged."
++    : "";
+   const shouldUseResumeDeltaPrompt = resumedSession && wakePrompt.length > 0;
+   const promptInstructionsPrefix = shouldUseResumeDeltaPrompt ? "" : instructionsPrefix;
+   const renderedPrompt =
+@@ -2996,6 +3005,7 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
+   const prompt = joinPromptSections([
+     promptInstructionsPrefix,
+     renderedBootstrapPrompt,
++    wakeTransportNote,
+     wakePrompt,
+     sessionHandoffNote,
+     taskContextNote,
+@@ -3014,7 +3024,7 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
+       wakePromptChars: wakePrompt.length,
+       sessionHandoffChars: sessionHandoffNote.length,
+       taskContextChars: taskContextNote.length,
+-      runtimeNoteChars: paperclipEnvNote.length + apiAccessNote.length,
++      runtimeNoteChars: paperclipEnvNote.length + apiAccessNote.length + wakeTransportNote.length,
+       heartbeatPromptChars: renderedPrompt.length,
+     },
+   };
+-- 
+2.55.0.windows.1
+
